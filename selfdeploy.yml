@@ -1,0 +1,363 @@
+application:
+    # input for advanced launch
+    configuration:
+        input.s3prefix: "latest"
+        input.feIps: ['54.145.157.245','54.145.9.153']
+        input.uiIps: ['54.147.233.106','54.147.49.29']
+        input.coreIp: ['54.163.172.182']
+        input.cobaltIp: ['54.205.39.72']
+        input.mongodb: 
+          vermilion: 'mongodb://vermilion:vermilion@ds063150.mongolab.com:63150/vermilion'
+          cobalt: 'mongodb://cobalt:cobalt@ds051459.mongolab.com:51459/cobalt'
+    interfaces:
+        # bindings for application input interface
+        input:
+            "*": bind(platform#input.*)
+        # bindings for application output interface
+        output:
+            nodes: bind(platform#result.nodes)
+            mongodb: bind(platform#result.mongodb)
+            appurl: bind(platform#result.appurl)
+    bindings:
+        - [ platform, properties ]
+    components:
+        properties:
+            type: reference.Service
+            interfaces:
+                properties:
+                    access-key: publish-signal(string)
+                    secret-key: publish-signal(string)
+        platform:
+            type: workflow.Instance
+            interfaces:
+                input:
+                    s3prefix: configuration(string)
+                    feIps: configuration(list<string>)
+                    uiIps: configuration(list<string>)
+                    coreIp: configuration(list<string>)
+                    cobaltIp: configuration(list<string>)
+                    mongodb: configuration(map<string, string>)
+                result:
+                    nodes:
+                        type: publish-signal(map<string, list<string>>)
+                        name: Nodes IPs
+                    mongodb:
+                        type: publish-signal(map<string, string>)
+                        name: MongoDB connection URLs
+                    appurl:
+                        type: publish-signal(string)
+                        name: Application entry point
+                    amqp:
+                        type: publish-signal(string)
+                        name: AMQP connection url
+                properties:
+                    access-key: consume-signal(string)
+                    secret-key: consume-signal(string)
+            required: [ properties ]
+            configuration:
+                configuration.propagateStatus: [ update ]
+                configuration.triggers:
+                    input.s3prefix: update
+                configuration.workflows:
+                    update: 
+                        parameters:
+                            - s3prefix:
+                                description: Artifacts version on S3
+                            - feIps:
+                                description: Front end nodes ips
+                            - uiIps:
+                                description: UI nodes ips
+                            - cobaltIp:
+                                description: Cobalt node ip
+                            - coreIp:
+                                description: Core node ip
+                        steps: &update_steps
+                            - getProps:
+                                action: getSignals
+                                output:
+                                    env: result
+                            # Provision nodes
+                            - provision-fe:
+                                action: provision-node
+                                phase: provision
+                                precedingPhases: [ getProps ]
+                                parameters:
+                                    roleName: "fe"
+                                    staticIps: "{$.feIps}"
+                                output:
+                                    feDns: dns
+                            - provision-ui:
+                                action: provision-node
+                                phase: provision
+                                precedingPhases: [ getProps ]
+                                parameters:
+                                    roleName: "ui"
+                                    staticIps: "{$.uiIps}"
+                                output:
+                                    uiDns: dns
+                            - provision-core:
+                                action: provision-node
+                                phase: provision
+                                precedingPhases: [ getProps ]
+                                parameters:
+                                    roleName: "core"
+                                    staticIps: "{$.coreIp}"
+                                output:
+                                    coreDns: dns
+                            - provision-cobalt:
+                                action: provision-node
+                                phase: provision
+                                precedingPhases: [ getProps ]
+                                parameters:
+                                    roleName: "cobalt"
+                                    staticIps: "{$.cobaltIp}"
+                                output:
+                                    cobaltDns: dns
+                            #
+                            # Preinstall Chef
+                            #
+                            - preinstall-chef:
+                                action: execrun
+                                precedingPhases: [ provision ]
+                                parameters:
+                                    roles: [ fe, ui, core, cobalt ]
+                                    command:
+                                        - !
+                                          rm -rf /tmp/scripts; mkdir -p /tmp/scripts; 
+                                          curl -kL https://adp-deploy.s3.amazonaws.com/s3sign.py | 
+                                          AWS_ACCESS_KEY_ID={$.env.properties.access-key} 
+                                          AWS_SECRET_ACCESS_KEY={$.env.properties.secret-key} 
+                                          python - 600 
+                                          https://s3.amazonaws.com/qubell-dev-repo/{$.s3prefix}/scripts.tar.gz
+                                          | xargs curl -kL | tar -xzf - -C /tmp/scripts;
+                                          yum -y -q clean plugins;
+                                          /tmp/scripts/utils/chef-install.sh
+                                output:
+                                    url: stdout
+#                            - mongo-deploy:
+#                                action: execrun
+#                                precedingPhases: [ mongo-repo ]
+#                                parameters:
+#                                    roles: [ mq_1 ]
+#                                    command:
+#                                        - |
+#                                          set -e
+#                                          set -x
+#                                          yum -y install mongo-10gen-2.4.4 mongo-10gen-server-2.4.4
+#                                          sed -e 's/^\(bind_ip\)/#\1/' -i /etc/mongod.conf
+#                                          /etc/init.d/mongod restart
+#                                          sleep 60
+#                                          mongo localhost/vermilion --eval \
+#                                          'if (!db.getUser("genesis")) db.addUser("genesis", "genesis");'
+#                                          mongo localhost/cobalt --eval \
+#                                          'if (!db.getUser("cobalt")) db.addUser("cobalt","cobalt");'
+#                            - mongo-updatedb:
+#                                action: execrun
+#                                precedingPhases: [ mongo-deploy ]
+#                                parameters:
+#                                    roles: [ mq_1 ]
+#                                    command:
+#                                        - !
+#                                          curl -kL https://adp-deploy.s3.amazonaws.com/s3sign.py | 
+#                                          AWS_ACCESS_KEY_ID={$.env.properties.access-key} 
+#                                          AWS_SECRET_ACCESS_KEY={$.env.properties.secret-key} 
+#                                          python - 600 
+#                                          https://s3.amazonaws.com/qubell-dev-repo/${s3prefix}/database.tar.gz
+#                                          | xargs curl -kL | tar -xzf - -C /tmp;
+#                                          /tmp/database/migrate.sh -d "mongodb://genesis:genesis@localhost:27017/vermilion" -r
+#                            - mongo-prepare:
+#                                action: execrun
+#                                precedingPhases: [ mongo-updatedb ]
+#                                parameters:
+#                                    roles: [ mq_1 ]
+#                                    command:
+#                                        - curl https://adp-deploy.s3.amazonaws.com/platform_mongodb_prepare.js | mongo localhost/vermilion
+                            #
+                            # Deploy Platform
+                            #
+                            - deploy-ui:
+                                action: chef
+                                precedingPhases: [ preinstall-chef ]
+                                parameters:
+                                    roles: [ ui ]
+                                    runList: [ "role[role_adp_portal]" ]
+                                    s3prefix: "{$.s3prefix}"
+                                    jattrs: &jattrs
+                                        adp:
+                                            amqp:
+                                                uri: "amqps://genesis:genesis@{$.uiDns[0]}:5671/genesis"
+                                                cobalt_uri: "amqp://cobalt:cobalt@{$.uiDns[0]}:5672/cobalt"
+                                                users:
+                                                    genesis:
+                                                        name: genesis
+                                                        password: genesis
+                                                        vhost: "/genesis"
+                                                        admin: true
+                                                    cobalt:
+                                                        name: cobalt
+                                                        password: cobalt
+                                                        vhost: "/cobalt"
+                                            mongodb_uri: "{$.mongodb['vermilion']}"
+                                            cobalt:
+                                                mongodb_uri: "{$.mongodb['cobalt']}"
+                                                nodes: "{$.coreIp}"
+                                            ui:
+                                                ssl_offloading_enabled: "true"
+                                                milestone: "v{$.s3prefix}"
+                                                nodes: "{$.uiIps}"
+                                            rabbitmq:
+                                                nodes: "{$.uiIps}"
+                                            backend:
+                                                kissmetrics_api_key: ""
+                                            aws:
+                                                s3:
+                                                    enabled: "true"
+                                                    bucket: "qubell-dev-repo"
+                                                    prefix: "{$.s3prefix}"
+                                                    access_key: "{$.env.properties.access-key}"
+                                                    secret_key: "{$.env.properties.secret-key}"
+                                            selfhealing: "true"
+                                            local_haproxy: "false"
+                            - deploy-fe:
+                                action: chef
+                                precedingPhases: [ preinstall-chef, deploy-ui ]
+                                parameters:
+                                    roles: [ fe ]
+                                    runList: [ "role[role_adp_proxy]" ]
+                                    s3prefix: "{$.s3prefix}"
+                                    jattrs: *jattrs
+                            - deploy-core:
+                                action: chef
+                                precedingPhases: [ preinstall-chef, deploy-ui ]
+                                parameters:
+                                    roles: [ core ]
+                                    runList: [ "role[role_adp_genesis]" ]
+                                    s3prefix: "{$.s3prefix}"
+                                    jattrs: *jattrs
+                            - deploy-cobalt:
+                                action: chef
+                                precedingPhases: [ preinstall-chef, deploy-ui ]
+                                parameters:
+                                    roles: [ cobalt ]
+                                    runList: [ "role[role_adp_cobalt]" ]
+                                    s3prefix: "{$.s3prefix}"
+                                    jattrs: *jattrs
+
+                        return: &update_return
+                            nodes:
+                                value:
+                                    fe_1: "{$.feDns}"
+                                    mq_1: "{$.uiDns}"
+                                    be_1: "{$.coreDns}"
+                                    be_2: "{$.cobaltDns}"
+                            appurl:
+                                value: "https://{$.feDns[0]}"
+                            mongodb:
+                                value:
+                                    vermilion: "{$.mongodb['vermilion']}"
+                                    cobalt: "{$.mongodb['cobalt']}"
+                            amqp:
+                                value: "amqps://genesis:genesis@{$.uiDns[0]}:5671/genesis"
+
+                    launch:
+                        steps: *update_steps
+                        return:
+                            nodes:
+                                value:
+                                    fe: "{$.feDns}"
+                                    ui: "{$.uiDns}"
+                                    core: "{$.coreDns}"
+                                    cobalt: "{$.cobaltDns}"
+                            appurl:
+                                value: "https://{$.feDns[0]}"
+                            mongodb:
+                                value:
+                                    vermilion: "{$.mongodb['vermilion']}"
+                                    cobalt: "{$.mongodb['cobalt']}"
+                            amqp:
+                                value: "amqps://genesis:genesis@{$.uiDns[0]}:5671/genesis"
+
+                    destroy:
+                        steps: []
+
+                    ##############
+                    ### MACROS ###
+                    ##############
+
+                    # Provision node with public DNS
+                    provision-node: &provision-node
+                        parameters:
+                            - roleName:
+                                description: Role for the provisioned node
+                            - staticIps:
+                                description: Ips
+                        steps:
+                            - getProps:
+                                action: getSignals
+                                output:
+                                    env: result
+                            - provision-node:
+                                action: provisionVms
+                                precedingPhases: [ getProps ]
+                                parameters:
+                                    roleName: "{$.roleName}"
+                                    vmIdentity: root
+                                    hardwareId: "static"
+                                    staticIps: "{$.staticIps}"
+                                output:
+                                    ips: ips
+                            - public-dns:
+                                action: execrun
+                                precedingPhases: [ provision-node ]
+                                parameters:
+                                    roles: [ "{$.roleName}" ]
+                                    command:
+                                        - curl -s http://169.254.169.254/latest/meta-data/public-hostname
+                                output:
+                                    dns: stdout
+                        return:
+                            dns:
+                                value: "{$.dns['*']}"
+
+                    # Run chef with private cookbooks
+                    chef: &chef
+                        parameters:
+                            - roles:
+                                description: Roles to run on
+                            - runList:
+                                description: Chef run list
+                            - jattrs:
+                                description: Chef attributes
+                                default: {}
+                            - s3prefix:
+                                description: Application version
+                        steps:
+                            - getProps:
+                                action: getSignals
+                                output:
+                                    env: result
+                            - sign-cookbook-url:
+                                action: execrun
+                                precedingPhases: [ getProps ]
+                                parameters:
+                                    roles: "{$.roles}"
+                                    command:
+                                        - !
+                                          curl -kL https://adp-deploy.s3.amazonaws.com/s3sign.py | 
+                                          AWS_ACCESS_KEY_ID={$.env.properties.access-key} 
+                                          AWS_SECRET_ACCESS_KEY={$.env.properties.secret-key} 
+                                          python - 1800
+                                          https://s3.amazonaws.com/qubell-dev-repo/{$.s3prefix}/cookbooks.tar.gz
+                                          | xargs echo -n
+                                output:
+                                    url: stdout
+                            - chef-run:
+                                action: chefsolo
+                                precedingPhases: [ sign-cookbook-url ]
+                                parameters:
+                                    roles: "{$.roles}"
+                                    runList: "{$.runList}"
+                                    recipeUrl: "{$.url['*'][0]}"
+                                    jattrs: "{$.jattrs}"
+
+
